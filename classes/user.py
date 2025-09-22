@@ -1,6 +1,6 @@
 class User():
-    def __init__(self, fullname: str, userid: int, tasks: list[dict]):
-        self.fullname = fullname
+    def __init__(self, name: str, userid: int, tasks: list[dict]):
+        self.name = name
         self.userid = userid
         self.complite_tasks = self.count_complite_tasks(tasks)
 
