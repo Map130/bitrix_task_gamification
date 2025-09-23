@@ -1,5 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pika
 requests
 python-dotenv
+pydantic
+redis

@@ -28,6 +28,23 @@ services:
       retries: 5
     restart: unless-stopped
 
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-app_db}
+      POSTGRES_USER: ${POSTGRES_USER:-app_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app_pass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   producer:
     build: ./producer
     env_file: .env
@@ -36,6 +53,22 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      config-server:
+        condition: service_started # Зависит от старта конфиг-сервера
+    restart: unless-stopped
+
+  producer-webhook:
+    build: ./producer_webhook
+    env_file: .env
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      config-server:
+        condition: service_started # Зависит от старта конфиг-сервера
     restart: unless-stopped
 
   consumer:
@@ -48,6 +81,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      config-server:
+        condition: service_started # Зависит от старта конфиг-сервера
     restart: unless-stopped
 
   api:
@@ -60,25 +95,23 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      config-server:
+        condition: service_started # Зависит от старта конфиг-сервера
     restart: unless-stopped
 
-  producer-webhook:
-    build:
-      context: ./producer
-      dockerfile: Dockerfile.webhook
+  config-server:
+    build: ./config-server
     env_file: .env
     ports:
-      - "${PRODUCER_WH_PORT}:${PRODUCER_WH_PORT}"
+      - "8090:8090" # Отдельный порт для API управления конфигами
     depends_on:
-      - rabbitmq
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
-  consumer-webhook:
-    build:
-      context: ./consumer
-      dockerfile: Dockerfile.webhook
-    env_file: .env
-    depends_on:
-      - rabbitmq
-      - redis
-    restart: unless-stopped
+volumes:
+  postgres_data:

@@ -19,7 +19,7 @@ HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SEC","60"))
 RETRIES = int(os.getenv("RETRIES","4"))
 BACKOFF = float(os.getenv("BACKOFF_BASE_SEC","0.6"))
 QUEUE_USERS = os.getenv("QUEUE_USERS","bitrix.users.map")
-QUEUE_TASKS = os.getenv("QUEUE_TASKS","bitrix.tasks.closed.week")
+QUEUE_TASKS = os.getenv("QUEUE_TASKS_EVENTS","bitrix.tasks.events")
 MAX_CMDS = 50
 TZ = ZoneInfo(TZ_NAME)
 
@@ -118,26 +118,64 @@ def open_channel():
     ch.queue_declare(queue=QUEUE_TASKS, durable=True)
     return conn, ch
 
+import json, os, time, logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
+
+import pika, requests
+from dotenv import load_dotenv
+
+# Импортируем наш новый модуль для работы с конфигом
+from shared.config import get_config_value
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+load_dotenv()
+# ... (остальные переменные)
+# ... (код функций fetch_closed, rest, batch и т.д. остается без изменений)
+
 def main():
     logging.info("Producer starting...")
+    
+    # Небольшая задержка перед стартом, чтобы config-server успел заполнить Redis
+    time.sleep(5) 
+
     conn, ch = open_channel()
     logging.info("RabbitMQ connection and channel opened.")
     try:
         while True:
-            logging.info("Fetching users map...")
-            users_map = get_users_map()
-            ch.basic_publish("", QUEUE_USERS, json.dumps({str(k):v for k,v in users_map.items()}, ensure_ascii=False).encode(),
-                             pika.BasicProperties(content_type="application/json", delivery_mode=2))
-            logging.info(f"Published {len(users_map)} users to queue '{QUEUE_USERS}'")
+            # Получаем текущий режим работы
+            mode = get_config_value("producer_mode", "none")
 
-            logging.info("Fetching closed tasks for users...")
-            tasks_map = fetch_closed(list(users_map.keys()))
-            ch.basic_publish("", QUEUE_TASKS, json.dumps({str(k):v for k,v in tasks_map.items()}, ensure_ascii=False).encode(),
-                             pika.BasicProperties(content_type="application/json", delivery_mode=2))
-            logging.info(f"Published tasks for {len(tasks_map)} users to queue '{QUEUE_TASKS}'")
+            if mode == "polling":
+                logging.info("Running in 'polling' mode.")
+                
+                logging.info("Fetching users map...")
+                users_map = get_users_map()
+                ch.basic_publish("", QUEUE_USERS, json.dumps({str(k):v for k,v in users_map.items()}, ensure_ascii=False).encode(),
+                                 pika.BasicProperties(content_type="application/json", delivery_mode=2))
+                logging.info(f"Published {len(users_map)} users to queue '{QUEUE_USERS}'")
 
-            logging.info(f"Sleeping for {REFETCH} seconds...")
-            time.sleep(REFETCH)
+                logging.info("Fetching closed tasks for users...")
+                tasks_map = fetch_closed(list(users_map.keys()))
+                
+                snapshot_payload = {
+                    "type": "snapshot",
+                    "data": {str(k): v for k, v in tasks_map.items()}
+                }
+                
+                ch.basic_publish("", QUEUE_TASKS_EVENTS, json.dumps(snapshot_payload, ensure_ascii=False).encode(),
+                                 pika.BasicProperties(content_type="application/json", delivery_mode=2))
+                logging.info(f"Published task snapshot for {len(tasks_map)} users to queue '{QUEUE_TASKS_EVENTS}'")
+
+                logging.info(f"Sleeping for {REFETCH} seconds...")
+                time.sleep(REFETCH)
+            else:
+                logging.info(f"Standby mode. Current mode is '{mode}'. Checking again in 60 seconds.")
+                time.sleep(60)
+
     except KeyboardInterrupt:
         logging.info("Producer stopped by user.")
     except Exception as e:

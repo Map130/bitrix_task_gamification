@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+# База данных
+sqlalchemy
+asyncpg
+# Redis
+redis
+# RabbitMQ
+aio_pika

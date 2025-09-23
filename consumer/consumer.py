@@ -24,7 +24,7 @@ load_dotenv()
 RABBITMQ_URL = os.getenv("RABBITMQ_URL","amqp://guest:guest@rabbitmq:5672/")
 REDIS_URL    = os.getenv("REDIS_URL","redis://redis:6379/0")
 QUEUE_USERS  = os.getenv("QUEUE_USERS","bitrix.users.map")
-QUEUE_TASKS  = os.getenv("QUEUE_TASKS","bitrix.tasks.closed.week")
+QUEUE_TASKS_EVENTS = os.getenv("QUEUE_TASKS_EVENTS","bitrix.tasks.events")
 PREFETCH     = int(os.getenv("PREFETCH","32"))
 
 TZ_NAME      = os.getenv("TZ_NAME","Asia/Almaty")
@@ -90,14 +90,59 @@ async def handle_users(msg: aio_pika.IncomingMessage, redis: Redis):
             logging.error(f"An error occurred in handle_users: {e}", exc_info=True)
 
 async def handle_tasks(msg: aio_pika.IncomingMessage, redis: Redis):
+    """
+    Универсальный обработчик событий по задачам.
+    Может обрабатывать как полные "снимки" данных, так и единичные "события".
+    """
     async with msg.process():
         try:
+            payload = json.loads(msg.body.decode())
+            msg_type = payload.get("type")
+            msg_data = payload.get("data")
+
+            if not msg_type or not msg_data:
+                logging.warning(f"Invalid message format, missing 'type' or 'data': {payload}")
+                return
+
             now = datetime.now(TZ)
             ttl = _ttl_until_next(now)
-            await redis.set(KEY_TASKS_JSON, msg.body, ex=ttl)
-            logging.info(f"Stored weekly tasks in '{KEY_TASKS_JSON}' with TTL {ttl}s.")
+            
+            # Обработка полного снимка данных
+            if msg_type == "snapshot":
+                await redis.set(KEY_TASKS_JSON, json.dumps(msg_data, ensure_ascii=False), ex=ttl)
+                logging.info(f"Stored weekly tasks snapshot in '{KEY_TASKS_JSON}' with TTL {ttl}s.")
+
+            # Обработка единичного события
+            elif msg_type == "event":
+                user_id = str(msg_data.get("user_id"))
+                task_id = msg_data.get("task_id")
+
+                if not user_id or not task_id:
+                    logging.warning(f"Invalid event message, missing 'user_id' or 'task_id': {msg_data}")
+                    return
+
+                # Используем блокировку для безопасного обновления JSON
+                async with redis.lock("lock:tasks_update", timeout=10):
+                    raw_data = await redis.get(KEY_TASKS_JSON)
+                    current_tasks = json.loads(raw_data) if raw_data else {}
+                    
+                    user_tasks = current_tasks.get(user_id, [])
+                    if task_id not in user_tasks:
+                        user_tasks.append(task_id)
+                    
+                    current_tasks[user_id] = user_tasks
+                    
+                    await redis.set(KEY_TASKS_JSON, json.dumps(current_tasks, ensure_ascii=False), ex=ttl)
+                    logging.info(f"Appended task {task_id} for user {user_id}. TTL set to {ttl}s.")
+            
+            else:
+                logging.warning(f"Unknown message type '{msg_type}'. Ignoring.")
+
+        except json.JSONDecodeError:
+            logging.error("Failed to decode JSON from tasks message body.")
         except Exception as e:
             logging.error(f"An error occurred in handle_tasks: {e}", exc_info=True)
+
 
 async def main():
     logging.info("Consumer starting...")
