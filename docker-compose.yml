@@ -61,3 +61,24 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+
+  producer-webhook:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile.webhook
+    env_file: .env
+    ports:
+      - "${PRODUCER_WH_PORT}:${PRODUCER_WH_PORT}"
+    depends_on:
+      - rabbitmq
+    restart: unless-stopped
+
+  consumer-webhook:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile.webhook
+    env_file: .env
+    depends_on:
+      - rabbitmq
+      - redis
+    restart: unless-stopped
