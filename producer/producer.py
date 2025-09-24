@@ -1,189 +1,274 @@
-import json, os, time, logging
+"""
+Асинхронный продюсер для сбора данных из Bitrix24 в режиме 'polling'.
+
+Новая архитектура:
+1.  При старте сервис запрашивает всю конфигурацию у `config-server`.
+2.  Инициализирует `ConfigManager` для получения динамических обновлений.
+3.  Периодически (или по триггеру обновления конфига) проверяет,
+    установлен ли `producer_mode` в `polling`.
+4.  Если да, выполняет полный цикл сбора данных и отправки в RabbitMQ.
+"""
+import asyncio
+import json
+import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-import pika, requests
-from dotenv import load_dotenv
+import aio_pika
+import aiohttp
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from shared.bootstrapper import fetch_config_from_server
+from shared.config_manager import ConfigManager
+from shared.utils import setup_logging
 
-load_dotenv()
-WEBHOOK = os.getenv("BITRIX_WEBHOOK_URL","").rstrip("/")
-RABBIT  = os.getenv("RABBITMQ_URL","amqp://guest:guest@rabbitmq:5672/%2F")
-TZ_NAME = os.getenv("TZ_NAME","Asia/Almaty")
-REFETCH = int(os.getenv("REFETCH_INTERVAL_SEC","300"))
-BATCH_PAUSE = float(os.getenv("BATCH_PAUSE_SEC","0.2"))
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SEC","60"))
-RETRIES = int(os.getenv("RETRIES","4"))
-BACKOFF = float(os.getenv("BACKOFF_BASE_SEC","0.6"))
-QUEUE_USERS = os.getenv("QUEUE_USERS","bitrix.users.map")
-QUEUE_TASKS = os.getenv("QUEUE_TASKS_EVENTS","bitrix.tasks.events")
-MAX_CMDS = 50
-TZ = ZoneInfo(TZ_NAME)
+# --- Настройка ---
+setup_logging()
+logger = logging.getLogger(__name__)
 
-if not WEBHOOK:
-    raise RuntimeError("BITRIX_WEBHOOK_URL is required")
+# --- Глобальный объект конфигурации ---
+CONFIG: Dict[str, Any] = {}
 
-def week_bounds_iso():
-    now = datetime.now(TZ)
-    mon = now - timedelta(days=now.weekday())
-    mon = mon.replace(hour=0, minute=0, second=0, microsecond=0)
-    sun = mon + timedelta(days=6, hours=23, minutes=59, seconds=59)
-    return mon.isoformat(), sun.isoformat()
 
-def _post(url, payload):
-    last = None
-    for i in range(1, RETRIES+1):
+# --- Утилиты для работы с API Bitrix24 ---
+
+def get_week_bounds_iso(tz_name: str) -> Tuple[str, str]:
+    """Возвращает ISO-строки для начала и конца текущей недели."""
+    tz = ZoneInfo(tz_name)
+    now = datetime.now(tz)
+    monday = now - timedelta(days=now.weekday())
+    monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    sunday = monday + timedelta(days=6, hours=23, minutes=59, seconds=59)
+    return monday.isoformat(), sunday.isoformat()
+
+
+async def make_api_request(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
+    """Выполняет POST-запрос к API Bitrix24 с логикой повторных попыток."""
+    http_retries = int(CONFIG.get("HTTP_RETRIES", 4))
+    http_timeout = int(CONFIG.get("HTTP_TIMEOUT_SEC", 60))
+    backoff_sec = float(CONFIG.get("HTTP_BACKOFF_SEC", 0.6))
+    
+    last_exception = None
+    for i in range(1, http_retries + 1):
         try:
-            r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, dict) and "error" in data:
-                error_message = data.get("error_description", data["error"])
-                logging.error(f"Bitrix API error: {error_message}")
-                raise RuntimeError(error_message)
-            return data
-        except Exception as e:
-            last = e
-            logging.warning(f"Request failed (attempt {i}/{RETRIES}): {e}")
-            if i < RETRIES: time.sleep(BACKOFF*(2**(i-1)))
+            async with session.post(url, json=payload, timeout=http_timeout) as response:
+                response.raise_for_status()
+                data = await response.json()
+                if isinstance(data, dict) and "error" in data:
+                    error_message = data.get("error_description", data["error"])
+                    logger.error(f"Bitrix API error: {error_message}")
+                    raise aiohttp.ClientResponseError(
+                        response.request_info, response.history,
+                        status=response.status, message=error_message
+                    )
+                return data
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_exception = e
+            logger.warning(f"Request failed (attempt {i}/{http_retries}): {e}")
+            if i < http_retries:
+                await asyncio.sleep(backoff_sec * (2 ** (i - 1)))
             else:
-                logging.error(f"Request failed after {RETRIES} retries.")
-                raise last
+                logger.error(f"Request failed after {http_retries} retries.")
+                raise last_exception
 
-def rest(method, payload):
-    return _post(f"{WEBHOOK}/{method}.json", payload)
 
-def batch(cmd: Dict[str,str], halt=0):
-    return _post(f"{WEBHOOK}/batch.json", {"cmd": cmd, "halt": halt})
+async def rest(session: aiohttp.ClientSession, method: str, payload: dict) -> dict:
+    """Выполняет один REST-запрос."""
+    bitrix_webhook_url = CONFIG.get("BITRIX_WEBHOOK_URL", "").rstrip("/")
+    if not bitrix_webhook_url:
+        raise ValueError("BITRIX_WEBHOOK_URL is not configured.")
+    url = f"{bitrix_webhook_url}/{method}.json"
+    return await make_api_request(session, url, payload)
 
-def get_users_map() -> Dict[int,str]:
-    out = {}
+
+async def batch(session: aiohttp.ClientSession, cmd: Dict[str, str], halt: int = 0) -> dict:
+    """Выполняет пакетный запрос."""
+    bitrix_webhook_url = CONFIG.get("BITRIX_WEBHOOK_URL", "").rstrip("/")
+    if not bitrix_webhook_url:
+        raise ValueError("BITRIX_WEBHOOK_URL is not configured.")
+    url = f"{bitrix_webhook_url}/batch.json"
+    return await make_api_request(session, url, {"cmd": cmd, "halt": halt})
+
+
+# --- Основная логика сбора данных ---
+
+async def get_users_map(session: aiohttp.ClientSession) -> Dict[int, str]:
+    """Получает полный список активных пользователей."""
+    users_map = {}
     start = 0
     while True:
-        resp = rest("user.search", {"FILTER":{"ACTIVE":"Y"},"SELECT":["ID","NAME","LAST_NAME"],"start":start})
-        for u in resp.get("result", []):
-            uid = int(u["ID"]); name = (" ".join([u.get("NAME") or "", u.get("LAST_NAME") or ""]).strip()) or f"User {uid}"
-            out[uid] = name
-        if "next" in resp: start = resp["next"]
-        else: break
-    return out
+        resp = await rest(session, "user.search", {
+            "FILTER": {"ACTIVE": "Y"},
+            "SELECT": ["ID", "NAME", "LAST_NAME"],
+            "start": start
+        })
+        result = resp.get("result", [])
+        if not result:
+            break
 
-def build_tasks_cmd(uid:int, dt_from:str, dt_to:str, start:int=0)->str:
+        for u in result:
+            user_id = int(u["ID"])
+            name = " ".join(filter(None, [u.get("NAME"), u.get("LAST_NAME")])).strip() or f"User {user_id}"
+            users_map[user_id] = name
+
+        if "next" in resp:
+            start = resp["next"]
+        else:
+            break
+    logger.info(f"Fetched {len(users_map)} active users.")
+    return users_map
+
+
+def build_tasks_cmd(user_id: int, dt_from: str, dt_to: str, start: int = 0) -> str:
+    """Формирует строку команды для запроса задач пользователя."""
     params = {
-        "filter[RESPONSIBLE_ID]": uid,
-        "filter[STATUS]": 5,
+        "filter[RESPONSIBLE_ID]": user_id,
+        "filter[STATUS]": 5,  # Завершенные задачи
         "filter[>=CLOSED_DATE]": dt_from,
         "filter[<=CLOSED_DATE]": dt_to,
-        "order[ID]":"asc",
+        "order[ID]": "asc",
         "start": start,
-        "select[]":["ID"]
+        "select[]": ["ID"]
     }
     return "tasks.task.list?" + urlencode(params, doseq=True)
 
-def fetch_closed(user_ids: List[int]) -> Dict[int, List[int]]:
-    dt_from, dt_to = week_bounds_iso()
-    remaining = {uid:0 for uid in user_ids}
-    out = {uid:[] for uid in user_ids}
-    while remaining:
-        cmd = {}; mapping: List[Tuple[str,int]] = []
-        for uid in list(remaining.keys())[:MAX_CMDS]:
-            start = remaining[uid]; alias = f"u{uid}_s{start}"
-            cmd[alias] = build_tasks_cmd(uid, dt_from, dt_to, start)
-            mapping.append((alias, uid))
-        data = batch(cmd)
-        res = (data.get("result") or {}).get("result", {})
-        nxt = (data.get("result") or {}).get("result_next", {})
-        for alias, uid in mapping:
-            page = res.get(alias) or {}
+
+async def fetch_closed_tasks(session: aiohttp.ClientSession, user_ids: List[int]) -> Dict[int, List[int]]:
+    """Асинхронно собирает ID завершенных задач для списка пользователей."""
+    tz_name = CONFIG.get("TZ_NAME", "UTC")
+    dt_from, dt_to = get_week_bounds_iso(tz_name)
+    remaining_users = {uid: 0 for uid in user_ids}
+    all_tasks = {uid: [] for uid in user_ids}
+    max_cmds_in_batch = int(CONFIG.get("MAX_CMDS_IN_BATCH", 50))
+    batch_pause_sec = float(CONFIG.get("BATCH_PAUSE_SEC", 0.2))
+
+    while remaining_users:
+        cmd_batch = {}
+        mapping: List[Tuple[str, int]] = []
+
+        for user_id, start_from in list(remaining_users.items())[:max_cmds_in_batch]:
+            alias = f"u{user_id}_s{start_from}"
+            cmd_batch[alias] = build_tasks_cmd(user_id, dt_from, dt_to, start_from)
+            mapping.append((alias, user_id))
+
+        data = await batch(session, cmd_batch)
+        result = (data.get("result") or {}).get("result", {})
+        next_pages = (data.get("result") or {}).get("result_next", {})
+
+        for alias, user_id in mapping:
+            page = result.get(alias, {})
             tasks = page.get("tasks", []) or page.get("result", []) or []
-            ids = []
-            for t in tasks:
-                tid = t.get("ID") or t.get("id")
-                if tid is None: continue
-                try: ids.append(int(tid))
-                except: pass
-            out[uid].extend(ids)
-            if alias in nxt: remaining[uid] = nxt[alias]
-            else: remaining.pop(uid, None)
-        if remaining: time.sleep(BATCH_PAUSE)
-    return out
+            task_ids = [int(t["ID"]) for t in tasks if t.get("ID")]
+            all_tasks[user_id].extend(task_ids)
 
-def open_channel():
-    params = pika.URLParameters(RABBIT)
-    conn = pika.BlockingConnection(params); ch = conn.channel()
-    ch.queue_declare(queue=QUEUE_USERS, durable=True)
-    ch.queue_declare(queue=QUEUE_TASKS, durable=True)
-    return conn, ch
-
-import json, os, time, logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
-from urllib.parse import urlencode
-from zoneinfo import ZoneInfo
-
-import pika, requests
-from dotenv import load_dotenv
-
-# Импортируем наш новый модуль для работы с конфигом
-from shared.config import get_config_value
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-load_dotenv()
-# ... (остальные переменные)
-# ... (код функций fetch_closed, rest, batch и т.д. остается без изменений)
-
-def main():
-    logging.info("Producer starting...")
-    
-    # Небольшая задержка перед стартом, чтобы config-server успел заполнить Redis
-    time.sleep(5) 
-
-    conn, ch = open_channel()
-    logging.info("RabbitMQ connection and channel opened.")
-    try:
-        while True:
-            # Получаем текущий режим работы
-            mode = get_config_value("producer_mode", "none")
-
-            if mode == "polling":
-                logging.info("Running in 'polling' mode.")
-                
-                logging.info("Fetching users map...")
-                users_map = get_users_map()
-                ch.basic_publish("", QUEUE_USERS, json.dumps({str(k):v for k,v in users_map.items()}, ensure_ascii=False).encode(),
-                                 pika.BasicProperties(content_type="application/json", delivery_mode=2))
-                logging.info(f"Published {len(users_map)} users to queue '{QUEUE_USERS}'")
-
-                logging.info("Fetching closed tasks for users...")
-                tasks_map = fetch_closed(list(users_map.keys()))
-                
-                snapshot_payload = {
-                    "type": "snapshot",
-                    "data": {str(k): v for k, v in tasks_map.items()}
-                }
-                
-                ch.basic_publish("", QUEUE_TASKS_EVENTS, json.dumps(snapshot_payload, ensure_ascii=False).encode(),
-                                 pika.BasicProperties(content_type="application/json", delivery_mode=2))
-                logging.info(f"Published task snapshot for {len(tasks_map)} users to queue '{QUEUE_TASKS_EVENTS}'")
-
-                logging.info(f"Sleeping for {REFETCH} seconds...")
-                time.sleep(REFETCH)
+            if alias in next_pages:
+                remaining_users[user_id] = next_pages[alias]
             else:
-                logging.info(f"Standby mode. Current mode is '{mode}'. Checking again in 60 seconds.")
-                time.sleep(60)
+                del remaining_users[user_id]
 
-    except KeyboardInterrupt:
-        logging.info("Producer stopped by user.")
+        if remaining_users:
+            logger.info(f"{len(remaining_users)} users still have more tasks to fetch. Pausing...")
+            await asyncio.sleep(batch_pause_sec)
+
+    total_tasks = sum(len(tasks) for tasks in all_tasks.values())
+    logger.info(f"Fetched a total of {total_tasks} closed tasks for {len(user_ids)} users.")
+    return all_tasks
+
+
+# --- Функции для работы с RabbitMQ ---
+
+async def publish_message(channel: aio_pika.Channel, queue_name: str, message: dict):
+    """Публикует сообщение в указанную очередь."""
+    await channel.default_exchange.publish(
+        aio_pika.Message(
+            body=json.dumps(message).encode('utf-8'),
+            content_type="application/json",
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+        ),
+        routing_key=queue_name,
+    )
+    logger.info(f"Published message to '{queue_name}'.")
+
+
+# --- Основной цикл продюсера ---
+
+async def run_polling_cycle(session: aiohttp.ClientSession, channel: aio_pika.Channel):
+    """Выполняет один полный цикл сбора и отправки данных."""
+    logger.info("Starting new polling cycle...")
+    queue_users = CONFIG.get("QUEUE_USERS", "bitrix.users.map")
+    queue_tasks = CONFIG.get("QUEUE_TASKS_EVENTS", "bitrix.tasks.events")
+    
+    try:
+        users = await get_users_map(session)
+        if users:
+            await publish_message(channel, queue_users, users)
+
+        user_ids = list(users.keys())
+        if user_ids:
+            tasks = await fetch_closed_tasks(session, user_ids)
+            await publish_message(channel, queue_tasks, {"type": "snapshot", "data": tasks})
+
+        logger.info("Polling cycle finished successfully.")
+
+    except (aiohttp.ClientError, ValueError) as e:
+        logger.error(f"A critical error occurred during the polling cycle: {e}. Skipping this cycle.")
     except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}", exc_info=True)
-    finally:
-        if conn and not conn.is_closed:
-            conn.close()
-            logging.info("RabbitMQ connection closed.")
+        logger.critical(f"An unexpected error occurred in polling cycle: {e}", exc_info=True)
+
+
+async def main():
+    """Главная функция запуска сервиса."""
+    logger.info("Producer service starting...")
+    
+    global CONFIG
+    CONFIG = await fetch_config_from_server()
+
+    rabbitmq_url = CONFIG.get("RABBITMQ_URL")
+    redis_url = CONFIG.get("REDIS_URL")
+    if not rabbitmq_url or not redis_url:
+        raise RuntimeError("RABBITMQ_URL and REDIS_URL must be configured.")
+
+    config_manager = ConfigManager(redis_url, rabbitmq_url)
+    await config_manager.initialize()
+
+    async with aiohttp.ClientSession() as session:
+        connection = await aio_pika.connect_robust(rabbitmq_url)
+        async with connection:
+            channel = await connection.channel()
+            queue_users = CONFIG.get("QUEUE_USERS", "bitrix.users.map")
+            queue_tasks = CONFIG.get("QUEUE_TASKS_EVENTS", "bitrix.tasks.events")
+            await channel.declare_queue(queue_users, durable=True)
+            await channel.declare_queue(queue_tasks, durable=True)
+            logger.info("RabbitMQ queues declared.")
+
+            while True:
+                try:
+                    if config_manager.get_config("producer_mode") == "polling":
+                        await run_polling_cycle(session, channel)
+                    else:
+                        logger.info("Producer is in standby mode (producer_mode is not 'polling').")
+                    
+                    refetch_interval = int(CONFIG.get("REFETCH_INTERVAL_SEC", 300))
+                    try:
+                        await asyncio.wait_for(
+                            config_manager.wait_for_update(),
+                            timeout=refetch_interval
+                        )
+                        logger.info("Configuration updated, re-evaluating polling cycle.")
+                        continue
+                    except asyncio.TimeoutError:
+                        pass
+
+                except Exception as e:
+                    logger.critical(f"Critical error in main loop: {e}", exc_info=True)
+                    await asyncio.sleep(30)
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Producer service stopped by user.")
+    except Exception as e:
+        logger.critical(f"Producer service failed to start: {e}", exc_info=True)

@@ -8,3 +8,5 @@ asyncpg
 redis
 # RabbitMQ
 aio_pika
+# Шифрование
+cryptography

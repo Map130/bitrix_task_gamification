@@ -1,7 +1,7 @@
-fastapi
-uvicorn[standard]
-pika
-requests
-python-dotenv
-pydantic
-redis
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+aio-pika==9.4.1
+pydantic==2.9.0
+redis==5.0.8
+aiohttp==3.9.5
+

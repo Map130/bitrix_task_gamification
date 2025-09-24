@@ -1,6 +1,14 @@
 FROM python:3.12-slim
+
 WORKDIR /app
-COPY requirements.txt .
+
+# Копируем requirements из папки consumer и устанавливаем зависимости
+COPY consumer/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY consumer.py .
-CMD ["python","-u","consumer.py"]
+
+# Копируем код consumer и shared в рабочую директорию
+COPY consumer/ /app/
+COPY shared/ /app/shared/
+
+# Запускаем приложение
+CMD ["python", "consumer.py"]

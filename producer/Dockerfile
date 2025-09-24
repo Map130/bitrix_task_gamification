@@ -1,6 +1,14 @@
 FROM python:3.12-slim
+
 WORKDIR /app
-COPY requirements.txt .
+
+# Копируем requirements из папки producer и устанавливаем зависимости
+COPY producer/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY producer.py .
-CMD ["python","-u","producer.py"]
+
+# Копируем код producer и shared в рабочую директорию
+COPY producer/ /app/
+COPY shared/ /app/shared/
+
+# Запускаем приложение
+CMD ["python", "producer.py"]
