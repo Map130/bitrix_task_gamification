@@ -202,15 +202,36 @@ async def get_config_by_key(key: str):
 # --- Вспомогательные функции ---
 
 async def seed_initial_data():
-    """Seed the database with initial configuration data."""
+    """Заполняет БД начальными конфигурациями, если они еще не существуют."""
+    logger.info("Seeding initial data...")
+    
+    # Значения по умолчанию, которые будут добавлены, если их нет в БД.
+    # (value, is_secret)
     initial_configs = {
         "BITRIX_WEBHOOK_URL": ("your_bitrix_webhook_url_here", True),
-        "RABBITMQ_QUEUE_TASKS": ("tasks_queue", False),
-        "RABBITMQ_QUEUE_RESULTS": ("results_queue", False),
         "API_KEY": ("your_api_key_here", True),
         "RABBITMQ_URL": (os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/%2F"), False),
         "REDIS_URL": (os.getenv("REDIS_URL", "redis://redis:6379/0"), False),
+        
+        # Настройки для producer
+        "REFETCH_INTERVAL_SEC": (os.getenv("REFETCH_INTERVAL_SEC", "10"), False),
+        "BATCH_PAUSE_SEC": (os.getenv("BATCH_PAUSE_SEC", "1"), False),
+        "HTTP_TIMEOUT_SEC": (os.getenv("HTTP_TIMEOUT_SEC", "60"), False),
+        "RETRIES": (os.getenv("RETRIES", "4"), False),
+        "BACKOFF_BASE_SEC": (os.getenv("BACKOFF_BASE_SEC", "0.6"), False),
+
+        # Настройки для consumer
+        "TZ_NAME": (os.getenv("TZ_NAME", "Asia/Almaty"), False),
+        "WEEKLY_RESET_DOW": (os.getenv("WEEKLY_RESET_DOW", "1"), False),
+        "WEEKLY_RESET_TIME": (os.getenv("WEEKLY_RESET_TIME", "03:00"), False),
+        "INACTIVE_DAYS": (os.getenv("INACTIVE_DAYS", "14"), False),
+        "PREFETCH": (os.getenv("PREFETCH", "32"), False),
+
+        # Имена очередей
+        "QUEUE_USERS": (os.getenv("QUEUE_USERS", "bitrix.users.map"), False),
+        "QUEUE_TASKS_EVENTS": (os.getenv("QUEUE_TASKS_EVENTS", "bitrix.tasks.events"), False),
     }
+
     async with engine.begin() as conn:
         for key, (value, is_secret) in initial_configs.items():
             # Check if the key already exists
